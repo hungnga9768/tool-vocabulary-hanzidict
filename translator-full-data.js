@@ -7,9 +7,11 @@ import pLimit from 'p-limit';
 // Configuration
 const INPUT_FILE = 'vocabulary.csv';
 const OUTPUT_FILE = 'translated-full.csv';
-const CONCURRENT_REQUESTS = 2;
-const REQUEST_DELAY = 3000;
-const MAX_RETRIES = 2;
+const CONCURRENT_REQUESTS = 1; // Reduced to 1 to save memory
+const REQUEST_DELAY = 2000; // Reduced delay
+const MAX_RETRIES = 3; // Tăng số lần retry
+const MEMORY_CLEANUP_INTERVAL = 10; // Clean memory every 10 words
+const SKIP_AFTER_FAILURES = 5; // Skip từ sau 5 lần thất bại liên tiếp
 
 // Rate limiter
 const limit = pLimit(CONCURRENT_REQUESTS);
@@ -20,6 +22,7 @@ let stats = {
     successful: 0,
     failed: 0,
     skipped: 0,
+    consecutiveFailures: 0,
     startTime: Date.now()
 };
 
@@ -34,7 +37,24 @@ function sleep(ms) {
 }
 
 /**
- * Initialize browser
+ * Monitor and log memory usage
+ */
+function logMemoryUsage(context = '') {
+    const memUsage = process.memoryUsage();
+    const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+    const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+    const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+    
+    console.log(`📊 ${context} Memory: Heap ${heapUsedMB}/${heapTotalMB}MB, RSS ${rssMB}MB`);
+    
+    // Warning if memory usage is high
+    if (heapUsedMB > 1000) {
+        console.warn(`⚠️ High memory usage detected: ${heapUsedMB}MB`);
+    }
+}
+
+/**
+ * Initialize browser with memory-efficient settings
  */
 async function initBrowser() {
     if (!browser) {
@@ -48,10 +68,17 @@ async function initBrowser() {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--memory-pressure-off',
+                '--max_old_space_size=4096',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-features=TranslateUI',
+                '--disable-ipc-flooding-protection'
             ]
         });
-        console.log('✅ Browser started');
+        console.log('✅ Browser started with memory-efficient settings');
     }
     return browser;
 }
@@ -70,22 +97,33 @@ async function closeBrowser() {
 /**
  * Extract all data from Hanzii.net page
  */
-async function extractFullData(chineseWord, retryCount = 0) {
+export async function extractFullData(chineseWord, retryCount = 0) {
     let page = null;
     
     try {
         const browserInstance = await initBrowser();
         page = await browserInstance.newPage();
         
+        // Set memory-efficient options
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setViewport({ width: 1366, height: 768 });
+        
+        // Disable images and CSS to save memory
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (req.resourceType() === 'stylesheet' || req.resourceType() === 'image') {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
         
         const url = `https://hanzii.net/search/word/${encodeURIComponent(chineseWord)}?hl=vi`;
         console.log(`Fetching: ${chineseWord} (${url})`);
         
         await page.goto(url, { 
-            waitUntil: 'networkidle0',
-            timeout: 30000 
+            waitUntil: 'domcontentloaded',
+            timeout: 60000 
         });
         
         try {
@@ -96,7 +134,7 @@ async function extractFullData(chineseWord, retryCount = 0) {
             console.log(`⏰ Timeout waiting for content to load for ${chineseWord}`);
         }
         
-        await sleep(2000);
+        await sleep(3000); // Tăng thời gian chờ
         
         const content = await page.content();
         const $ = cheerio.load(content);
@@ -113,23 +151,46 @@ async function extractFullData(chineseWord, retryCount = 0) {
             chinese_explanation: '',
             example_sentence_chinese: '',
             example_sentence_pinyin: '',
+            example_sentence_vietnamese: '',
             grammar_pattern: '',
             related_compounds: '',
             radical_info: '',
             stroke_count: '',
             stroke_order: '',
-            popularity: ''
+            popularity: '',
+            word_type: '',
+            measure_words: '',
+            synonyms: '',
+            hsk_level: '',
+            tocfl_level: '',
+            popularity_rank: '',
+            search_count: '',
+            image_url: '',
+            topic_category: '',
+            ai_level: ''
         };
         
-        // Extract Traditional Chinese (if different from simplified)
-        $('.simple-tradition-wrap').each((i, el) => {
+        // Extract Traditional Chinese from wrap-convert elements
+        $('.wrap-convert').each((i, el) => {
             const text = $(el).text().trim();
-            if (text && text !== chineseWord && text.match(/[\u4e00-\u9fff]/)) {
-                if (!result.traditional_chinese && text.length <= chineseWord.length + 2) {
-                    result.traditional_chinese = text;
-                }
+            // Remove brackets and extract traditional characters
+            const traditional = text.replace(/[【】]/g, '').trim();
+            if (traditional && traditional !== chineseWord && traditional.match(/[\u4e00-\u9fff]/)) {
+                result.traditional_chinese = traditional;
+                return false;
             }
         });
+        
+        // Fallback: look in simple-tradition-wrap
+        if (!result.traditional_chinese) {
+            $('.simple-tradition-wrap').each((i, el) => {
+                const text = $(el).text().trim();
+                if (text && text !== chineseWord && text.match(/[\u4e00-\u9fff]/) && text.length <= chineseWord.length + 2) {
+                    result.traditional_chinese = text;
+                    return false;
+                }
+            });
+        }
         
         // Extract Pinyin variations
         $('.txt-pinyin').each((i, el) => {
@@ -159,46 +220,70 @@ async function extractFullData(chineseWord, retryCount = 0) {
             }
         });
         
-        // Extract level
+        // Extract AI level from txt-slot
         $('.txt-slot').each((i, el) => {
             const text = $(el).text().trim();
             if (text && text.match(/^\d+$/)) {
-                result.level = text;
+                result.ai_level = text;
             }
         });
         
-        // Extract Vietnamese meaning (primary)
-        let meaning = '';
-        
-        // Method 1: Main meaning
-        const meaningElement = $('.txt-mean .simple-tradition-wrap').first();
-        if (meaningElement.length > 0) {
-            meaning = meaningElement.text().trim();
-        }
-        
-        // Method 2: Box meaning
-        if (!meaning) {
-            const boxMeanElement = $('.box-mean .txt-mean').first();
-            if (boxMeanElement.length > 0) {
-                meaning = boxMeanElement.text().trim().replace(/^\d+\.\s*/, '');
+        // Extract HSK and TOCFL levels
+        $('.tags').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text.includes('HSK')) {
+                result.hsk_level = text;
+            } else if (text.includes('TOCFL')) {
+                result.tocfl_level = text;
             }
-        }
+        });
         
-        // Method 3: Look for Vietnamese text
-        if (!meaning) {
-            $('.simple-tradition-wrap').each((i, el) => {
+        // Extract word type (Danh từ, Động từ, etc.)
+        $('.box-title').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text && (text.includes('Danh từ') || text.includes('Động từ') || text.includes('Tính từ') || text.includes('Phó từ'))) {
+                result.word_type = text;
+            }
+        });
+        
+        // Extract Vietnamese meaning (all meanings combined)
+        const meanings = [];
+        
+        // Method 1: Extract all meanings from .box-mean elements (target the simple-tradition-wrap inside)
+        $('.box-mean .txt-mean .simple-tradition-wrap').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text && text.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/)) {
+                meanings.push(text);
+            }
+        });
+        
+        // Method 2: If no meanings found, try main meaning elements
+        if (meanings.length === 0) {
+            $('.txt-mean .simple-tradition-wrap').each((i, el) => {
                 const text = $(el).text().trim();
                 if (text && text !== chineseWord && 
                     text.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/)) {
-                    if (!meaning) {
-                        meaning = text;
-                        return false;
-                    }
+                    meanings.push(text);
                 }
             });
         }
         
-        result.vietnamese_meaning = meaning || 'Không tìm thấy';
+        // Method 3: Look for Vietnamese text in simple-tradition-wrap if still no meanings
+        if (meanings.length === 0) {
+            $('.simple-tradition-wrap').each((i, el) => {
+                const text = $(el).text().trim();
+                if (text && text !== chineseWord && 
+                    text.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/) &&
+                    !text.match(/[\u4e00-\u9fff]/) && // Exclude Chinese characters
+                    text.length > 3 && text.length < 200) {
+                    meanings.push(text);
+                }
+            });
+        }
+        
+        // Remove duplicates and combine meanings
+        const uniqueMeanings = [...new Set(meanings)];
+        result.vietnamese_meaning = uniqueMeanings.length > 0 ? uniqueMeanings.join('; ') : 'Không tìm thấy';
         
         // Extract Chinese explanation
         $('.txt-mean-explain .simple-tradition-wrap').each((i, el) => {
@@ -209,24 +294,73 @@ async function extractFullData(chineseWord, retryCount = 0) {
             }
         });
         
-        // Extract example sentences
-        let exampleFound = false;
-        $('.simple-tradition-wrap').each((i, el) => {
-            const text = $(el).text().trim();
-            if (!exampleFound && text && text.includes('。') && text.match(/[\u4e00-\u9fff]/)) {
-                result.example_sentence_chinese = text;
-                exampleFound = true;
+        // Extract example sentences with better targeting
+        // Look specifically in example sections
+        $('example .box-example').first().each((i, el) => {
+            const $example = $(el);
+            
+            // Extract Chinese sentence
+            const chineseSentence = $example.find('.simple-tradition-wrap').first().text().trim();
+            if (chineseSentence && chineseSentence.match(/[\u4e00-\u9fff]/)) {
+                result.example_sentence_chinese = chineseSentence;
             }
+            
+            // Extract pinyin
+            const pinyin = $example.find('.ex-phonetic').text().trim();
+            if (pinyin) {
+                result.example_sentence_pinyin = pinyin;
+            }
+            
+            // Extract Vietnamese translation (last text element in example)
+            $example.find('div').last().each((j, vietEl) => {
+                const vietText = $(vietEl).text().trim();
+                if (vietText && 
+                    vietText.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/) &&
+                    !vietText.match(/[\u4e00-\u9fff]/) &&
+                    vietText !== pinyin) {
+                    result.example_sentence_vietnamese = vietText;
+                }
+            });
         });
         
-        // Extract example sentence pinyin
-        $('.ex-phonetic').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text && text.match(/[a-zA-Z]/)) {
-                result.example_sentence_pinyin = text;
-                return false;
-            }
-        });
+        // Fallback: if no example found in structured way, try general search
+        if (!result.example_sentence_chinese) {
+            $('.simple-tradition-wrap').each((i, el) => {
+                const text = $(el).text().trim();
+                if (text && text.includes('。') && text.match(/[\u4e00-\u9fff]/) && text.length > 3) {
+                    result.example_sentence_chinese = text;
+                    return false;
+                }
+            });
+        }
+        
+        // Fallback for pinyin
+        if (!result.example_sentence_pinyin) {
+            $('.ex-phonetic').each((i, el) => {
+                const text = $(el).text().trim();
+                if (text && text.match(/[a-zA-Z]/)) {
+                    result.example_sentence_pinyin = text;
+                    return false;
+                }
+            });
+        }
+        
+        // Fallback for Vietnamese translation
+        if (!result.example_sentence_vietnamese) {
+            $('.box-example .font-16.fw-400.cl-pr-sm').each((i, el) => {
+                const text = $(el).text().trim();
+                if (text && 
+                    text.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/) &&
+                    !text.match(/[\u4e00-\u9fff]/) &&
+                    text.length > 8 &&
+                    text.length < 150 &&
+                    !text.includes('Trang chủ') &&
+                    !text.includes('Dịch')) {
+                    result.example_sentence_vietnamese = text;
+                    return false;
+                }
+            });
+        }
         
         // Extract grammar pattern
         $('.simple-tradition-wrap').each((i, el) => {
@@ -237,11 +371,38 @@ async function extractFullData(chineseWord, retryCount = 0) {
             }
         });
         
-        // Extract related compounds
+        // Extract measure words
+        $('.word-deco').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text && text.includes('[') && text.includes(']')) {
+                // Extract measure words like "个, 位, 名 [gè, wèi, míng]"
+                const measureMatch = text.match(/([^\[]+)\s*\[([^\]]+)\]/);
+                if (measureMatch) {
+                    result.measure_words = measureMatch[1].trim() + ' [' + measureMatch[2].trim() + ']';
+                }
+            }
+        });
+        
+        // Extract synonyms from compound section with better parsing
+        const synonyms = [];
+        $('#syno .compound .txt-compound').each((i, el) => {
+            const $el = $(el);
+            const chineseText = $el.find('.simple-tradition-wrap').text().trim();
+            const vietnameseText = $el.text().replace(chineseText, '').trim();
+            
+            if (chineseText && chineseText.match(/[\u4e00-\u9fff]/) && chineseText !== chineseWord) {
+                // Combine Chinese and Vietnamese if available
+                const synonym = vietnameseText ? `${chineseText} (${vietnameseText})` : chineseText;
+                synonyms.push(synonym);
+            }
+        });
+        result.synonyms = synonyms.slice(0, 5).join('; ');
+        
+        // Extract related compounds (different from synonyms)
         const compounds = [];
         $('.txt-compound').each((i, el) => {
             const text = $(el).text().trim();
-            if (text && text.match(/[\u4e00-\u9fff]/)) {
+            if (text && text.match(/[\u4e00-\u9fff]/) && !synonyms.includes(text)) {
                 const cleanText = text.replace(/^\d+\.\s*/, '');
                 if (cleanText && cleanText !== chineseWord) {
                     compounds.push(cleanText);
@@ -270,7 +431,60 @@ async function extractFullData(chineseWord, retryCount = 0) {
             }
         });
         
-        // Extract popularity info
+        // Extract popularity rank and search count
+        $('.rank').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text && text.startsWith('#')) {
+                result.popularity_rank = text;
+            }
+        });
+        
+        $('.popularity-content').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text && text.includes('Được tra cứu')) {
+                const countMatch = text.match(/Được tra cứu\s*(\d+)\s*lần/);
+                if (countMatch) {
+                    result.search_count = countMatch[1];
+                }
+            }
+        });
+        
+        // Extract image URL
+        $('img[src*="hanzii.net"]').each((i, el) => {
+            const src = $(el).attr('src');
+            if (src && src.includes('img_word')) {
+                result.image_url = src;
+                return false;
+            }
+        });
+        
+        // Extract topic category from section with image
+        $('.section').each((i, el) => {
+            const $el = $(el);
+            const text = $el.text().trim();
+            // Look for sections with Chinese characters and images (topic categories)
+            if (text && text.match(/[\u4e00-\u9fff]/) && $el.find('img').length > 0) {
+                result.topic_category = text;
+                return false;
+            }
+        });
+        
+        // Extract additional multiple meanings if available
+        const allMeanings = [];
+        $('.content-item .box-mean .txt-mean').each((i, el) => {
+            const meaningText = $(el).find('.simple-tradition-wrap').text().trim();
+            if (meaningText && meaningText.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/)) {
+                allMeanings.push(meaningText);
+            }
+        });
+        
+        // If we found structured meanings, use them instead
+        if (allMeanings.length > 0) {
+            const uniqueAllMeanings = [...new Set(allMeanings)];
+            result.vietnamese_meaning = uniqueAllMeanings.join('; ');
+        }
+        
+        // Extract popularity info (general)
         $('[class*="txt-detail"]').each((i, el) => {
             const text = $(el).text().trim();
             if (text.includes('Độ phổ biến')) {
@@ -293,21 +507,51 @@ async function extractFullData(chineseWord, retryCount = 0) {
         console.log(`✅ Extracted data for ${chineseWord}:`);
         console.log(`   Meaning: ${result.vietnamese_meaning.substring(0, 50)}...`);
         console.log(`   Pinyin: ${result.pinyin_latin}`);
-        console.log(`   Level: ${result.level}`);
+        console.log(`   AI Level: ${result.ai_level}`);
+        console.log(`   HSK: ${result.hsk_level}, TOCFL: ${result.tocfl_level}`);
+        console.log(`   Type: ${result.word_type}`);
+        console.log(`   Measure words: ${result.measure_words}`);
+        console.log(`   Synonyms: ${result.synonyms}`);
+        console.log(`   Example: ${result.example_sentence_chinese}`);
+        console.log(`   Vietnamese ex: ${result.example_sentence_vietnamese}`);
+        console.log(`   Popularity: ${result.popularity_rank}`);
+        console.log(`   Search count: ${result.search_count}`);
+        console.log(`   Topic: ${result.topic_category}`);
+        console.log(`   Image: ${result.image_url ? 'Yes' : 'No'}`);
         
         stats.successful++;
+        stats.consecutiveFailures = 0; // Reset consecutive failures on success
         return result;
         
     } catch (error) {
-        console.error(`Error fetching ${chineseWord}:`, error.message);
+        console.error(`❌ Error fetching ${chineseWord}:`, error.message);
         
         if (retryCount < MAX_RETRIES) {
-            console.log(`Retrying ${chineseWord} (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-            await sleep(5000);
+            console.log(`🔄 Retrying ${chineseWord} (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+            
+            // Close current page if exists
+            if (page) {
+                try {
+                    await page.close();
+                } catch (closeError) {
+                    console.warn(`Warning closing page: ${closeError.message}`);
+                }
+            }
+            
+            // Wait longer between retries
+            const waitTime = (retryCount + 1) * 10000; // 10s, 20s, 30s...
+            console.log(`⏳ Waiting ${waitTime/1000}s before retry...`);
+            await sleep(waitTime);
+            
             return extractFullData(chineseWord, retryCount + 1);
         }
         
         stats.failed++;
+        stats.consecutiveFailures++;
+        
+        console.warn(`⚠️ Failed to process ${chineseWord} after ${MAX_RETRIES} attempts`);
+        console.warn(`📊 Consecutive failures: ${stats.consecutiveFailures}`);
+        
         return {
             simplified_chinese: chineseWord,
             traditional_chinese: '',
@@ -319,28 +563,58 @@ async function extractFullData(chineseWord, retryCount = 0) {
             chinese_explanation: '',
             example_sentence_chinese: '',
             example_sentence_pinyin: '',
+            example_sentence_vietnamese: '',
             grammar_pattern: '',
             related_compounds: '',
             radical_info: '',
             stroke_count: '',
             stroke_order: '',
-            popularity: ''
+            popularity: '',
+            word_type: '',
+            measure_words: '',
+            synonyms: '',
+            hsk_level: '',
+            tocfl_level: '',
+            popularity_rank: '',
+            search_count: '',
+            image_url: '',
+            topic_category: '',
+            ai_level: ''
         };
         
     } finally {
         if (page) {
-            await page.close();
+            try {
+                // Clear page cache and close properly
+                await page.evaluate(() => {
+                    // Clear memory
+                    if (window.gc) {
+                        window.gc();
+                    }
+                });
+                await page.close();
+                console.log(`🗑️ Closed page for ${chineseWord}`);
+            } catch (closeError) {
+                console.warn(`Warning: Error closing page for ${chineseWord}:`, closeError.message);
+            }
         }
     }
 }
 
 /**
- * Process a single Chinese word
+ * Process a single Chinese word with memory management
  */
-async function processWord(chineseWord) {
+async function processWord(chineseWord, wordIndex = 0) {
     return limit(async () => {
         const data = await extractFullData(chineseWord);
-        await sleep(1000);
+        
+        // Force garbage collection every few words
+        if (wordIndex % MEMORY_CLEANUP_INTERVAL === 0 && global.gc) {
+            console.log(`🧹 Running garbage collection after ${wordIndex} words`);
+            global.gc();
+        }
+        
+        await sleep(2000); // Tăng delay giữa các request
         return data;
     });
 }
@@ -415,6 +689,7 @@ async function loadExistingTranslations() {
 async function main() {
     try {
         console.log('🚀 Starting Full Data Extraction from Hanzii.net...');
+        logMemoryUsage('Initial');
         console.log(`📖 Reading ${INPUT_FILE}...`);
         
         // Read input CSV
@@ -449,34 +724,86 @@ async function main() {
         // Start with existing data
         const results = [...existingData];
         
-        // Process words in batches
-        const batchSize = 5; // Smaller batches for full data extraction
+        // Process words sequentially to avoid memory issues
+        console.log(`🔄 Processing words sequentially to manage memory...`);
         
-        for (let i = 0; i < chineseWords.length; i += batchSize) {
-            const batch = chineseWords.slice(i, i + batchSize);
-            console.log(`\n📦 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(chineseWords.length/batchSize)} (${batch.length} words)`);
+        for (let i = 0; i < chineseWords.length; i++) {
+            const word = chineseWords[i];
+            console.log(`\n📝 Processing word ${i + 1}/${chineseWords.length}: ${word}`);
             
-            const batchPromises = batch.map(word => processWord(word));
-            const batchResults = await Promise.all(batchPromises);
-            results.push(...batchResults);
+            try {
+                // Check if too many consecutive failures
+                if (stats.consecutiveFailures >= SKIP_AFTER_FAILURES) {
+                    console.warn(`🛑 Too many consecutive failures (${stats.consecutiveFailures}). Pausing for 60 seconds...`);
+                    await sleep(60000);
+                    
+                    // Restart browser after long pause
+                    console.log(`🔄 Restarting browser after pause...`);
+                    await closeBrowser();
+                    await sleep(5000);
+                }
+                
+                const result = await processWord(word, i);
+                results.push(result);
+                
+                // Show memory usage periodically
+                if (i % 5 === 0) {
+                    logMemoryUsage(`Word ${i + 1}:`);
+                }
+                
+            } catch (error) {
+                console.error(`❌ Error processing ${word}:`, error.message);
+                // Add failed result to maintain structure
+                results.push({
+                    simplified_chinese: word,
+                    traditional_chinese: '',
+                    pinyin_latin: '',
+                    pinyin_zhuyin: '',
+                    pinyin_vietnamese: '',
+                    level: '',
+                    vietnamese_meaning: 'Lỗi xử lý',
+                    chinese_explanation: '',
+                    example_sentence_chinese: '',
+                    example_sentence_pinyin: '',
+                    example_sentence_vietnamese: '',
+                    grammar_pattern: '',
+                    related_compounds: '',
+                    radical_info: '',
+                    stroke_count: '',
+                    stroke_order: '',
+                    popularity: '',
+                    word_type: '',
+                    measure_words: '',
+                    synonyms: '',
+                    hsk_level: '',
+                    tocfl_level: '',
+                    popularity_rank: '',
+                    search_count: '',
+                    image_url: '',
+                    topic_category: '',
+                    ai_level: ''
+                });
+            }
             
-            // Save progress after each batch
-            console.log(`💾 Saving progress to ${OUTPUT_FILE}...`);
-            writeCSV(results, OUTPUT_FILE);
+            // Save progress every 10 words
+            if ((i + 1) % 10 === 0 || i === chineseWords.length - 1) {
+                console.log(`💾 Saving progress to ${OUTPUT_FILE}...`);
+                writeCSV(results, OUTPUT_FILE);
+                
+                const processed = i + 1;
+                const percentage = ((processed / chineseWords.length) * 100).toFixed(1);
+                const totalProcessed = stats.skipped + processed;
+                const totalPercentage = ((totalProcessed / allChineseWords.length) * 100).toFixed(1);
+                
+                console.log(`✅ Progress: ${processed}/${chineseWords.length} (${percentage}%)`);
+                console.log(`📊 Overall: ${totalProcessed}/${allChineseWords.length} (${totalPercentage}%) - Saved to file`);
+            }
             
-            // Progress update
-            const processed = Math.min(i + batchSize, chineseWords.length);
-            const percentage = ((processed / chineseWords.length) * 100).toFixed(1);
-            const totalProcessed = stats.skipped + processed;
-            const totalPercentage = ((totalProcessed / allChineseWords.length) * 100).toFixed(1);
-            
-            console.log(`✅ Batch progress: ${processed}/${chineseWords.length} (${percentage}%)`);
-            console.log(`📊 Overall progress: ${totalProcessed}/${allChineseWords.length} (${totalPercentage}%) - Saved to file`);
-            
-            // Delay between batches
-            if (i + batchSize < chineseWords.length) {
-                console.log(`⏳ Waiting ${REQUEST_DELAY/1000}s before next batch...`);
-                await sleep(REQUEST_DELAY);
+            // Restart browser every 20 words to prevent memory buildup
+            if ((i + 1) % 20 === 0 && i < chineseWords.length - 1) {
+                console.log(`🔄 Restarting browser to free memory...`);
+                await closeBrowser();
+                await sleep(3000); // Wait before restarting
             }
         }
         
@@ -493,6 +820,7 @@ async function main() {
         console.log(`   • Success rate: ${((stats.successful / stats.total) * 100).toFixed(1)}%`);
         console.log(`   • Execution time: ${executionTime} seconds`);
         console.log(`   • Output file: ${OUTPUT_FILE}`);
+        logMemoryUsage('Final');
         
     } catch (error) {
         console.error('❌ Error:', error.message);
