@@ -7,7 +7,7 @@ import pLimit from 'p-limit';
 // Configuration
 const INPUT_FILE = 'vocabulary.csv';
 const OUTPUT_FILE = 'translated-full.csv';
-const CONCURRENT_REQUESTS = 1; // Reduced to 1 to save memory
+const CONCURRENT_REQUESTS = 3; // Tăng lên 3 để xử lý song song
 const REQUEST_DELAY = 2000; // Reduced delay
 const MAX_RETRIES = 3; // Tăng số lần retry
 const MEMORY_CLEANUP_INTERVAL = 10; // Clean memory every 10 words
@@ -111,7 +111,10 @@ export async function extractFullData(chineseWord, retryCount = 0) {
         // Disable images and CSS to save memory
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-            if (req.resourceType() === 'stylesheet' || req.resourceType() === 'image') {
+            if (req.resourceType() === 'stylesheet' || 
+                req.resourceType() === 'image' || 
+                req.resourceType() === 'font' ||
+                req.resourceType() === 'media') {
                 req.abort();
             } else {
                 req.continue();
@@ -724,44 +727,50 @@ async function main() {
         // Start with existing data
         const results = [...existingData];
         
-        // Process words sequentially to avoid memory issues
-        console.log(`🔄 Processing words sequentially to manage memory...`);
+        // Process words in small batches with concurrency
+        const batchSize = 5; // Xử lý 5 từ một lúc
+        console.log(`🔄 Processing words in batches of ${batchSize} with ${CONCURRENT_REQUESTS} concurrent requests...`);
         
-        for (let i = 0; i < chineseWords.length; i++) {
-            const word = chineseWords[i];
-            console.log(`\n📝 Processing word ${i + 1}/${chineseWords.length}: ${word}`);
+        for (let i = 0; i < chineseWords.length; i += batchSize) {
+            const batch = chineseWords.slice(i, i + batchSize);
+            const batchNumber = Math.floor(i / batchSize) + 1;
+            const totalBatches = Math.ceil(chineseWords.length / batchSize);
+            
+            console.log(`\n📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} words): ${batch.join(', ')}`);
+            
+            // Check if too many consecutive failures
+            if (stats.consecutiveFailures >= SKIP_AFTER_FAILURES) {
+                console.warn(`🛑 Too many consecutive failures (${stats.consecutiveFailures}). Pausing for 60 seconds...`);
+                await sleep(60000);
+                
+                // Restart browser after long pause
+                console.log(`🔄 Restarting browser after pause...`);
+                await closeBrowser();
+                await sleep(5000);
+                stats.consecutiveFailures = 0; // Reset after restart
+            }
             
             try {
-                // Check if too many consecutive failures
-                if (stats.consecutiveFailures >= SKIP_AFTER_FAILURES) {
-                    console.warn(`🛑 Too many consecutive failures (${stats.consecutiveFailures}). Pausing for 60 seconds...`);
-                    await sleep(60000);
-                    
-                    // Restart browser after long pause
-                    console.log(`🔄 Restarting browser after pause...`);
-                    await closeBrowser();
-                    await sleep(5000);
-                }
+                // Process batch concurrently
+                const batchPromises = batch.map((word, index) => processWord(word, i + index));
+                const batchResults = await Promise.all(batchPromises);
+                results.push(...batchResults);
                 
-                const result = await processWord(word, i);
-                results.push(result);
-                
-                // Show memory usage periodically
-                if (i % 5 === 0) {
-                    logMemoryUsage(`Word ${i + 1}:`);
-                }
+                // Show memory usage after each batch
+                logMemoryUsage(`Batch ${batchNumber}:`);
                 
             } catch (error) {
-                console.error(`❌ Error processing ${word}:`, error.message);
-                // Add failed result to maintain structure
-                results.push({
+                console.error(`❌ Error processing batch ${batchNumber}:`, error.message);
+                
+                // Add failed results for the entire batch
+                const failedResults = batch.map(word => ({
                     simplified_chinese: word,
                     traditional_chinese: '',
                     pinyin_latin: '',
                     pinyin_zhuyin: '',
                     pinyin_vietnamese: '',
                     level: '',
-                    vietnamese_meaning: 'Lỗi xử lý',
+                    vietnamese_meaning: 'Lỗi xử lý batch',
                     chinese_explanation: '',
                     example_sentence_chinese: '',
                     example_sentence_pinyin: '',
@@ -782,28 +791,33 @@ async function main() {
                     image_url: '',
                     topic_category: '',
                     ai_level: ''
-                });
+                }));
+                results.push(...failedResults);
             }
             
-            // Save progress every 10 words
-            if ((i + 1) % 10 === 0 || i === chineseWords.length - 1) {
-                console.log(`💾 Saving progress to ${OUTPUT_FILE}...`);
-                writeCSV(results, OUTPUT_FILE);
-                
-                const processed = i + 1;
-                const percentage = ((processed / chineseWords.length) * 100).toFixed(1);
-                const totalProcessed = stats.skipped + processed;
-                const totalPercentage = ((totalProcessed / allChineseWords.length) * 100).toFixed(1);
-                
-                console.log(`✅ Progress: ${processed}/${chineseWords.length} (${percentage}%)`);
-                console.log(`📊 Overall: ${totalProcessed}/${allChineseWords.length} (${totalPercentage}%) - Saved to file`);
-            }
+            // Save progress after each batch
+            console.log(`💾 Saving progress to ${OUTPUT_FILE}...`);
+            writeCSV(results, OUTPUT_FILE);
             
-            // Restart browser every 20 words to prevent memory buildup
-            if ((i + 1) % 20 === 0 && i < chineseWords.length - 1) {
-                console.log(`🔄 Restarting browser to free memory...`);
+            const processed = Math.min(i + batchSize, chineseWords.length);
+            const percentage = ((processed / chineseWords.length) * 100).toFixed(1);
+            const totalProcessed = stats.skipped + processed;
+            const totalPercentage = ((totalProcessed / allChineseWords.length) * 100).toFixed(1);
+            
+            console.log(`✅ Batch progress: ${processed}/${chineseWords.length} (${percentage}%)`);
+            console.log(`📊 Overall progress: ${totalProcessed}/${allChineseWords.length} (${totalPercentage}%) - Saved to file`);
+            
+            // Restart browser every 4 batches (20 words) to prevent memory buildup
+            if (batchNumber % 4 === 0 && i + batchSize < chineseWords.length) {
+                console.log(`🔄 Restarting browser to free memory after ${batchNumber} batches...`);
                 await closeBrowser();
                 await sleep(3000); // Wait before restarting
+            }
+            
+            // Delay between batches
+            if (i + batchSize < chineseWords.length) {
+                console.log(`⏳ Waiting ${REQUEST_DELAY/1000}s before next batch...`);
+                await sleep(REQUEST_DELAY);
             }
         }
         
